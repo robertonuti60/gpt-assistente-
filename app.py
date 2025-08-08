@@ -5,14 +5,12 @@ import requests
 from flask import Flask, request, jsonify
 import msal
 
-# ==========
-# Config
-# ==========
-CLIENT_ID     = os.environ.get("CLIENT_ID")          # Azure AD → App registrations → Application (client) ID
-CLIENT_SECRET = os.environ.get("CLIENT_SECRET")      # Azure AD → App registrations → Client secret (value)
-TENANT_ID     = os.environ.get("TENANT_ID")          # Azure AD → Tenant ID
-ONEDRIVE_USER = os.environ.get("ONEDRIVE_USER")      # UPN o id utente es. r_nuti@xxx.onmicrosoft.com
-API_KEY       = os.environ.get("API_KEY")            # chiave condivisa per proteggere gli endpoint
+# ====== Config da variabili d'ambiente ======
+CLIENT_ID     = os.environ.get("CLIENT_ID")        # Azure AD app client id
+CLIENT_SECRET = os.environ.get("CLIENT_SECRET")    # Azure AD client secret
+TENANT_ID     = os.environ.get("TENANT_ID")        # Azure AD tenant id
+ONEDRIVE_USER = os.environ.get("ONEDRIVE_USER")    # utente/UPN (es. name@tenant.onmicrosoft.com)
+API_KEY       = os.environ.get("API_KEY")          # chiave condivisa per /search e /read
 MAX_CHARS     = int(os.environ.get("MAX_CHARS", "500000"))
 
 GRAPH_SCOPE = ["https://graph.microsoft.com/.default"]
@@ -20,36 +18,35 @@ GRAPH_BASE  = "https://graph.microsoft.com/v1.0"
 
 app = Flask(__name__)
 
-
-# ==========
-# Helpers
-# ==========
+# ====== Helpers ======
 def require_api_key(f):
-    """Decoratore: richiede header x-api-key che matcha API_KEY."""
+    """Semplice guard che verifica l'header x-api-key se impostato in env."""
     def wrapper(*args, **kwargs):
-        if API_KEY and request.headers.get("x-api-key") != API_KEY:
-            return jsonify({"error": "Forbidden"}), 403
+        if API_KEY:
+            if request.headers.get("x-api-key") != API_KEY:
+                return jsonify({"error": "Forbidden"}), 403
         return f(*args, **kwargs)
     wrapper.__name__ = f.__name__
     return wrapper
 
-
 def get_token():
-    """Ottiene un access token per Microsoft Graph via MSAL (client credentials)."""
+    """Ottiene un Access Token per Microsoft Graph via MSAL (client_credential)."""
+    if not (CLIENT_ID and CLIENT_SECRET and TENANT_ID):
+        raise RuntimeError("CLIENT_ID / CLIENT_SECRET / TENANT_ID non configurati.")
     appc = msal.ConfidentialClientApplication(
         CLIENT_ID,
         authority=f"https://login.microsoftonline.com/{TENANT_ID}",
         client_credential=CLIENT_SECRET,
     )
-    result = appc.acquire_token_silent(GRAPH_SCOPE, account=None) or \
-             appc.acquire_token_for_client(scopes=GRAPH_SCOPE)
+    result = appc.acquire_token_silent(GRAPH_SCOPE, account=None)
+    if not result:
+        result = appc.acquire_token_for_client(scopes=GRAPH_SCOPE)
     if "access_token" not in result:
-        raise RuntimeError(f"Auth error: {result}")
+        raise RuntimeError(f"Errore auth MSAL: {result}")
     return result["access_token"]
 
-
 def gget(url, params=None, stream=False):
-    """GET helper verso Graph con bearer token, timeout e raise_for_status()."""
+    """GET su Graph con Bearer token."""
     token = get_token()
     r = requests.get(
         url,
@@ -61,20 +58,17 @@ def gget(url, params=None, stream=False):
     r.raise_for_status()
     return r
 
-
 def path_url(path: str) -> str:
-    """Costruisce l’URL Graph per un path OneDrive/SharePoint dell’utente indicato."""
-    p = (path or "").lstrip("/")
+    """Converte un path OneDrive in URL Graph (drive/root:/path)."""
+    p = path.lstrip("/")
+    if not ONEDRIVE_USER:
+        raise RuntimeError("ONEDRIVE_USER non configurato.")
     return f"{GRAPH_BASE}/users/{ONEDRIVE_USER}/drive/root:/{p}"
 
-
-# ==========
-# Estrattori di testo
-# ==========
+# ====== Estrattori testo ======
 def extract_pdf(binary: bytes) -> str:
     from pdfminer.high_level import extract_text
     return extract_text(io.BytesIO(binary))
-
 
 def extract_docx(binary: bytes) -> str:
     from docx import Document
@@ -85,43 +79,41 @@ def extract_docx(binary: bytes) -> str:
             parts.append("\t".join(c.text for c in row.cells))
     return "\n".join(parts)
 
+# ====== ROUTES ======
 
-# ==========
-# Routes
-# ==========
-@app.get("/")
-def root():
+# Home con documentazione rapida
+@app.route("/", methods=["GET"], strict_slashes=False)
+def index():
     return jsonify({
         "name": "gpt-assistente-api",
         "ok": True,
+        "note": "Usa x-api-key: <API_KEY> per /search e /read.",
         "endpoints": {
             "health": "/health",
-            "search": "/search?q=term&path=facoltativo",
-            "read": "POST /read { path: '/cartella/file.pdf' }"
-        },
-        "note": "Usa header 'x-api-key: <API_KEY>' per /search e /read."
+            "ping": "/ping",
+            "search": "/search?q=term&path=<facoltativo>",
+            "read": "POST /read  { path: '/cartella/file.pdf' }"
+        }
     })
 
-
-@app.get("/health")
+# Health (robusto: accetta /health e /health/)
+@app.route("/health", methods=["GET"], strict_slashes=False)
 def health():
-    return {"status": "ok"}
+    return jsonify({"ok": True}), 200
 
+# Ping test
+@app.route("/ping", methods=["GET"], strict_slashes=False)
+def ping():
+    return "pong", 200
 
-@app.get("/search")
+# Cerca file su OneDrive
+@app.route("/search", methods=["GET"], strict_slashes=False)
 @require_api_key
 def search():
-    """
-    Cerca file in OneDrive.
-    query:
-      - q (string)   : termine di ricerca
-      - path (string): opzionale, path relativo (es. 'Normativa/NTC') per cercare dentro quella cartella
-    """
-    q    = (request.args.get("q") or "").strip()
-    path = (request.args.get("path") or "").strip()
-
+    q    = request.args.get("q", "").strip()
+    path = request.args.get("path", "").strip()
     if not q:
-        return {"error": "Missing 'q' (query term)"}, 400
+        return jsonify({"error": "Parametro q mancante"}), 400
 
     try:
         if path:
@@ -136,31 +128,26 @@ def search():
             full   = (parent + "/" + it.get("name")).replace("/drive/root:", "")
             out.append({
                 "name": it.get("name"),
-                "path": full,                  # questo path lo rimandi a /read
+                "path": full,   # questo path lo userai sul /read
                 "size": it.get("size"),
                 "webUrl": it.get("webUrl"),
                 "id": it.get("id"),
             })
-        return {"results": out}
-    except requests.HTTPError as http_err:
-        return {"error": "Graph error", "details": str(http_err), "body": http_err.response.text}, 502
+        return jsonify({"results": out}), 200
     except Exception as e:
-        return {"error": "Internal error", "details": str(e)}, 500
+        return jsonify({"error": f"Search failed: {e}"}), 500
 
-
-@app.post("/read")
+# Legge un file (PDF/DOCX/TXT)
+@app.route("/read", methods=["POST"], strict_slashes=False)
 @require_api_key
 def read():
-    """
-    Legge un file e ne estrae il testo.
-    body JSON: { "path": "/cartella/nomefile.pdf" }
-    """
-    body = request.get_json(silent=True) or {}
-    path = (body.get("path") or "").strip()
-    if not path:
-        return {"error": "Missing 'path'"}, 400
-
     try:
+        body = request.get_json(force=True, silent=True) or {}
+        path = body.get("path", "").strip()
+        if not path:
+            return jsonify({"error": "Missing 'path'"}), 400
+
+        # scarica il file
         content = gget(path_url(path) + ":/content", stream=True).content
         lower   = path.lower()
 
@@ -171,20 +158,17 @@ def read():
         elif lower.endswith(".txt"):
             text = content.decode("utf-8", errors="ignore")
         else:
-            return {"error": "Unsupported file type. Use .pdf, .docx, .txt"}, 415
+            return jsonify({"error": "Unsupported file type"}), 415
 
         if len(text) > MAX_CHARS:
-            text = text[:MAX_CHARS] + "\n\n[...troncato per MAX_CHARS...]"
+            text = text[:MAX_CHARS] + "\n\n[...troncato...]"
 
-        return {"path": path, "text": text}
-    except requests.HTTPError as http_err:
-        return {"error": "Graph error", "details": str(http_err), "body": http_err.response.text}, 502
+        return jsonify({"path": path, "text": text}), 200
     except Exception as e:
-        return {"error": "Extraction failed", "details": str(e)}, 500
+        return jsonify({"error": f"Read failed: {e}"}), 500
 
 
-# ==========
-# Entrypoint locale
-# ==========
+# ====== avvio locale ======
 if __name__ == "__main__":
+    # Render usa gunicorn, ma questo serve per test locale:
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
