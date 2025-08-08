@@ -1,0 +1,39 @@
+{
+  "openapi": "3.0.1",
+  "info": {
+    "title": "Studio Nuti OneDrive Connector",
+    "version": "1.0.0",
+    "description": "API per cercare e leggere documenti normativi da OneDrive."
+  },
+  "servers": [{ "url": "https://YOUR_DEPLOY_URL" }],
+  "paths": {
+    "/health": { "get": { "operationId": "health", "summary": "Ping", "responses": { "200": { "description": "OK" } } } },
+    "/search": {
+      "get": {
+        "operationId": "searchFiles",
+        "summary": "Cerca file",
+        "parameters": [
+          { "name": "q", "in": "query", "schema": { "type": "string" } },
+          { "name": "path", "in": "query", "schema": { "type": "string" }, "description": "Es. /Struttura_Normativa_GPT" }
+        ],
+        "responses": { "200": { "description": "Risultati" } },
+        "security": [{ "api_key": [] }]
+      }
+    },
+    "/read": {
+      "post": {
+        "operationId": "readFile",
+        "summary": "Legge un file e restituisce il testo",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] } } }
+        },
+        "responses": { "200": { "description": "Testo estratto" } },
+        "security": [{ "api_key": [] }]
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": { "api_key": { "type": "apiKey", "name": "x-api-key", "in": "header" } }
+  }
+}
